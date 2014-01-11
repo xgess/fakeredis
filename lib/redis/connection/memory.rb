@@ -9,10 +9,106 @@ require "fakeredis/zset"
 class Redis
   module Connection
     class Memory
+
+      module CommandExecutor
+        # Executes command, stores result in replies array
+        def write(command)
+          meffod = command.shift.to_s.downcase.to_sym
+          if respond_to?(meffod)
+            reply = send(meffod, *command)
+          else
+            raise Redis::CommandError, "ERR unknown command '#{meffod}'"
+          end
+
+          if reply == true
+            reply = 1
+          elsif reply == false
+            reply = 0
+          end
+
+          replies << reply
+          nil
+        end
+
+        # Reads out the next reply to send back
+        def read
+          replies.shift
+        end
+      end
+
+      module MultiExecutor
+        TRANSACTION_COMMANDS = [:exec, :multi, :discard].freeze
+
+        # Intercept all redis methods before we call commands.
+        # If we're in a multi context, just queue the commands (ignoring commands we define!)
+        # Otherwise, act as if we aren't here and let commands use normal CommandExecutor#write
+        def write(command)
+          if in_multi && !TRANSACTION_COMMANDS.include?(command[0])
+            multi_queue << command
+          else
+            super
+          end
+        end
+
+        # Successfully complete a multi context, running all the queued commands and returning an
+        # array of all the results of said commands.
+        # Makes sure the context is reset after commands are run too
+        def exec
+          self.in_multi = false
+          multi_queue.map do |command|
+            # Call the original command (calls up through CommandExecutor#write)
+            write(command)
+            # Read the result of this command out of the replies array to return from here instead
+            replies.pop
+          end
+
+        ensure
+          # Make sure we reset the context!
+          reset_multi
+        end
+
+        # Sets us up as being in a multi block and yields a block if given
+        def multi(&block)
+          self.in_multi = true
+          block.call(self) if block
+          "OK"
+        end
+
+        # Resets multi context without running any queued commands
+        def discard
+          reset_multi
+          "OK"
+        end
+
+        private
+
+        attr_writer :in_multi, :multi_queue
+
+        # Queue of commands to be run if we successfully exit this multi context
+        def multi_queue
+          @multi_queue ||= []
+        end
+
+        # Boolean, defines if we're in a multi context or not
+        def in_multi
+          @in_multi ||= false
+        end
+
+        # Reset us out of a multi context. Both boolean flag & empty queue
+        def reset_multi
+          self.in_multi = false
+          self.multi_queue = []
+        end
+      end
+
       include Redis::Connection::CommandHelper
       include FakeRedis
 
-      attr_accessor :buffer, :options
+      # Order dependent includes, MultiExecutor must come last!
+      include CommandExecutor
+      include MultiExecutor
+
+      attr_accessor :options
 
       # Tracks all databases for all instances across the current process.
       # We have to be able to handle two clients with the same host/port accessing
@@ -74,29 +170,6 @@ class Redis
       end
 
       def timeout=(usecs)
-      end
-
-      def write(command)
-        meffod = command.shift.to_s.downcase.to_sym
-        if respond_to?(meffod)
-          reply = send(meffod, *command)
-        else
-          raise Redis::CommandError, "ERR unknown command '#{meffod}'"
-        end
-
-        if reply == true
-          reply = 1
-        elsif reply == false
-          reply = 0
-        end
-
-        replies << reply
-        buffer << reply if buffer && meffod != :multi
-        nil
-      end
-
-      def read
-        replies.shift
       end
 
       # NOT IMPLEMENTED:
@@ -727,16 +800,6 @@ class Redis
       def shutdown; end
 
       def slaveof(host, port) ; end
-
-      def exec
-        buffer.tap {|x| self.buffer = nil }
-      end
-
-      def multi
-        self.buffer = []
-        yield if block_given?
-        "OK"
-      end
 
       def watch(_)
         "OK"
