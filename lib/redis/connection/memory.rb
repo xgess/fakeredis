@@ -984,7 +984,7 @@ class Redis
           return [] unless data[key]
           if number >= 0
             # replace with `data[key].to_a.sample(number)` when 1.8.7 is deprecated
-            (1..number).each_with_object([]) do |_, selected|
+            (1..number).inject([]) do |selected, _|
               available_elements = data[key].to_a - selected
               selected << available_elements[rand(available_elements.size)]
             end.compact
